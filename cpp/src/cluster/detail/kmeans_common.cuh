@@ -54,6 +54,7 @@
 #include <ctime>
 #include <optional>
 #include <random>
+#include <type_traits>
 
 namespace cuvs::cluster::kmeans::detail {
 
@@ -62,14 +63,20 @@ namespace cuvs::cluster::kmeans::detail {
  *
  * On Ampere (SM <= 8.x) always use fused.
  * On Hopper (SM 9.x) use fused when m or n >= 4096.
- * On Blackwell (SM >= 10.x) use unfused.
+ * On Blackwell (SM >= 10.x) the split GEMM/reduction path is generally faster.
+ * For low-K FP32 on SM80+, the packed-MMA fused path avoids both materializing the m-by-n
+ * distance matrix and FastF32's three-product MMA expansion.
  */
 template <typename MathT, typename IdxT, typename LabelT>
 bool use_fused(const raft::resources& handle, IdxT m, IdxT n, IdxT k)
 {
   cudaDeviceProp prop;
   prop = raft::resource::get_device_properties(handle);
-  if (prop.major <= 8) {
+  if (prop.major >= 8 && std::is_same_v<MathT, float> && k >= 2 && k <= 5) {
+    // MMA is the portable fallback on every supported tensor-core generation. WGMMA and
+    // tcgen05 backends can replace it only under their exact compile-time feature targets.
+    return true;
+  } else if (prop.major <= 8) {
     // Use fused for Ampere or before
     return true;
   } else if (prop.major == 9 && (m >= 4096 || n >= 4096)) {

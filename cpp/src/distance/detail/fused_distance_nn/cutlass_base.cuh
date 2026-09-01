@@ -159,6 +159,70 @@ void cutlassFusedDistanceNN(const DataT* x,
   CUVS_CUTLASS_TRY(fusedDistanceNN_op.run(stream));
 }
 
+template <int LogicalK,
+          int Alignment,
+          typename OutT,
+          typename IdxT,
+          typename CGReduceOpT,
+          typename DistanceFn,
+          typename ReduceOpT,
+          typename KVPReduceOpT>
+void cutlassFusedDistanceNNLowKTF32(const float* x,
+                                    const float* y,
+                                    const float* xn,
+                                    const float* yn,
+                                    IdxT m,
+                                    IdxT n,
+                                    OutT* output,
+                                    int* mutexes,
+                                    CGReduceOpT cg_reduce_op,
+                                    DistanceFn dist_op,
+                                    ReduceOpT red_op,
+                                    KVPReduceOpT pair_red_op,
+                                    cudaStream_t stream)
+{
+  using EpilogueOutputOp = cuvs::epilogue::thread::FusedDistanceNNEpilogueElementwise<
+    float, float, float, float, OutT, 1, DistanceFn, CGReduceOpT, ReduceOpT, KVPReduceOpT>;
+  using Kernel = typename cuvs::gemm::kernel::FusedDistanceNNLowKTF32Gemm<
+    LogicalK, Alignment, float, float, EpilogueOutputOp, 1, true>::GemmKernel;
+  using DeviceOp = cutlass::gemm::device::GemmGrouped<Kernel>;
+
+  rmm::device_uvector<cuda::binary_semaphore<cuda::thread_scope_device>> bin_mutex(m, stream);
+  initBinMutexKernel<<<(m / 256) + 1, 256, 0, stream>>>(bin_mutex.data(), m);
+  typename EpilogueOutputOp::Params epilogue_params(
+    dist_op, cg_reduce_op, red_op, pair_red_op, mutexes, bin_mutex.data());
+
+  // Preserve cuVS's K=16 scheduler contract. The custom MMA executes one native
+  // K8 group for logical K=2 and two K8 groups for logical K=3..5.
+  auto problem_size = cutlass::gemm::GemmCoord(m, n, 16);
+  int blocks_per_sm = DeviceOp::maximum_active_blocks();
+  int full_wave     = blocks_per_sm * raft::getMultiProcessorCount();
+  int column_tiles  = (problem_size.n() - 1 + Kernel::Mma::Shape::kN) / Kernel::Mma::Shape::kN;
+  int row_tiles     = (problem_size.m() - 1 + Kernel::Mma::Shape::kM) / Kernel::Mma::Shape::kM;
+  int total_tiles   = column_tiles * row_tiles;
+  int thread_blocks = row_tiles < full_wave ? (total_tiles < full_wave ? total_tiles : full_wave)
+                                             : row_tiles;
+
+  typename DeviceOp::Arguments arguments{problem_size,
+                                         1,
+                                         thread_blocks,
+                                         epilogue_params,
+                                         x,
+                                         y,
+                                         xn,
+                                         const_cast<float*>(yn),
+                                         output,
+                                         static_cast<int64_t>(LogicalK),
+                                         static_cast<int64_t>(LogicalK),
+                                         int64_t{1},
+                                         static_cast<int64_t>(n)};
+  rmm::device_uvector<uint8_t> workspace(DeviceOp::get_workspace_size(arguments), stream);
+  DeviceOp operation;
+  CUVS_CUTLASS_TRY(operation.can_implement(arguments));
+  CUVS_CUTLASS_TRY(operation.initialize(arguments, workspace.data(), stream));
+  CUVS_CUTLASS_TRY(operation.run(stream));
+}
+
 };  // namespace detail
 };  // namespace distance
 };  // namespace cuvs

@@ -18,11 +18,29 @@
 
 #include <cstddef>  // size_t
 #include <limits>   // std::numeric_limits
+#include <type_traits>
 
 namespace cuvs {
 namespace distance {
 
 namespace detail {
+
+template <typename IdxT>
+bool supportsLowKTF32Mma(IdxT m, IdxT n, IdxT k)
+{
+  if (m <= 0 || n <= 0 || k < 2 || k > 5 ||
+      m > static_cast<IdxT>(std::numeric_limits<int>::max()) ||
+      n > static_cast<IdxT>(std::numeric_limits<int>::max())) {
+    return false;
+  }
+  int device = 0;
+  RAFT_CUDA_TRY(cudaGetDevice(&device));
+  cudaDeviceProp properties{};
+  RAFT_CUDA_TRY(cudaGetDeviceProperties(&properties, device));
+  // MMA is the portable SM80+ backend. Future SM90a WGMMA and SM100/103 tcgen05
+  // implementations may override it when their compile-time feature targets are present.
+  return properties.major >= 8;
+}
 
 template <typename DataT,
           typename OutT,
@@ -89,6 +107,33 @@ void fusedL2NNImpl(OutT* min,
     using kvp_cg_min_reduce_op_ = kvp_cg_min_reduce_op<DataT, IdxT, OutT>;
     kvp_cg_min_reduce_op_ cg_reduce_op;
     L2Op L2_dist_op(sqrt);
+
+    if constexpr (std::is_same_v<DataT, float>) {
+      if (supportsLowKTF32Mma(m, n, k)) {
+        switch (k) {
+          case 2:
+            cutlassFusedDistanceNNLowKTF32<2, P::Veclen>(x, y, xn, yn, m, n, min, workspace,
+                                                         cg_reduce_op, L2_dist_op, redOp,
+                                                         pairRedOp, stream);
+            return;
+          case 3:
+            cutlassFusedDistanceNNLowKTF32<3, P::Veclen>(x, y, xn, yn, m, n, min, workspace,
+                                                         cg_reduce_op, L2_dist_op, redOp,
+                                                         pairRedOp, stream);
+            return;
+          case 4:
+            cutlassFusedDistanceNNLowKTF32<4, P::Veclen>(x, y, xn, yn, m, n, min, workspace,
+                                                         cg_reduce_op, L2_dist_op, redOp,
+                                                         pairRedOp, stream);
+            return;
+          case 5:
+            cutlassFusedDistanceNNLowKTF32<5, P::Veclen>(x, y, xn, yn, m, n, min, workspace,
+                                                         cg_reduce_op, L2_dist_op, redOp,
+                                                         pairRedOp, stream);
+            return;
+        }
+      }
+    }
 
     IdxT lda, ldb, ldd;
     lda = k, ldb = k, ldd = n;

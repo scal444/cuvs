@@ -38,6 +38,7 @@
 #pragma once
 
 #include "epilogue.cuh"
+#include "low_k_tf32_mma.cuh"
 #include "persistent_gemm.h"
 
 #include <cutlass/cutlass.h>
@@ -393,6 +394,45 @@ struct FusedDistanceNNGemm<double,
   using GemmKernel = FusedDistanceNNPersistent<typename GemmBase::Mma,
                                                Epilogue,
                                                ThreadblockSwizzle,
+                                               GroupScheduleMode::kDeviceOnly>;
+};
+
+template <int LogicalK,
+          int Alignment,
+          typename ElementC_,
+          typename ElementAccumulator,
+          typename EpilogueOutputOp,
+          int Stages,
+          bool isRowMajor>
+struct FusedDistanceNNLowKTF32Gemm {
+  static_assert(isRowMajor);
+  using Stock = FusedDistanceNNGemm<float,
+                                    Alignment,
+                                    float,
+                                    Alignment,
+                                    ElementC_,
+                                    ElementAccumulator,
+                                    EpilogueOutputOp,
+                                    Stages,
+                                    isRowMajor>;
+  static constexpr int TileN = Alignment == 1 ? 128 : 256;
+  static constexpr int WarpN = Alignment == 1 ? 32 : 64;
+  using Mma = cuvs::gemm::threadblock::LowKTF32Mma<LogicalK, TileN, WarpN>;
+  static_assert(std::is_same_v<typename Mma::LayoutC,
+                               typename Stock::GemmBase::Mma::LayoutC>);
+  using Epilogue = typename cuvs::epilogue::threadblock::FusedDistanceNNEpilogue<
+    typename Stock::GemmBase::Epilogue::Shape,
+    typename Mma::Operator,
+    Stock::GemmBase::Epilogue::kPartitionsK,
+    ElementAccumulator,
+    typename EpilogueOutputOp::ElementT,
+    ElementAccumulator,
+    EpilogueOutputOp,
+    typename Stock::NormXLayout,
+    Stock::GemmBase::Epilogue::kElementsPerAccess>::Epilogue;
+  using GemmKernel = FusedDistanceNNPersistent<Mma,
+                                               Epilogue,
+                                               typename Stock::ThreadblockSwizzle,
                                                GroupScheduleMode::kDeviceOnly>;
 };
 
