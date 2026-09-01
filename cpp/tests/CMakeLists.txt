@@ -14,7 +14,7 @@ rapids_test_init()
 
 function(ConfigureTest)
 
-  set(options NOCUDA FETCH_CODEBOOKS RUN_SERIAL)
+  set(options NOCUDA FETCH_CODEBOOKS RUN_SERIAL HEADER_ONLY)
   set(oneValueArgs NAME GPUS PERCENT)
   set(multiValueArgs PATH ADDITIONAL_DEP)
 
@@ -37,10 +37,14 @@ function(ConfigureTest)
   endif()
 
   add_executable(${TEST_NAME} ${_CUVS_TEST_PATH})
+  set(_CUVS_TEST_LIBRARY_LINKS cuvs cuvs::cuvs)
+  if(_CUVS_TEST_HEADER_ONLY)
+    set(_CUVS_TEST_LIBRARY_LINKS cuvs::cuvs_cpp_headers)
+  endif()
+
   target_link_libraries(
     ${TEST_NAME}
-    PRIVATE cuvs
-            cuvs::cuvs
+    PRIVATE ${_CUVS_TEST_LIBRARY_LINKS}
             raft::raft
             rtcx::rtcx
             GTest::gtest
@@ -114,6 +118,21 @@ ConfigureTest(
   GPUS 1
   PERCENT 100
 )
+
+ConfigureTest(
+  NAME LOW_K_DISTANCE_TEST
+  PATH neighbors/distance_nn_low_k.cu
+  HEADER_ONLY
+  GPUS 1
+  PERCENT 100
+)
+
+if(CMAKE_COMPILER_IS_GNUCXX)
+  # GCC 15 diagnoses RAFT's size-probing snprintf call even though no output buffer is written.
+  target_compile_options(
+    LOW_K_DISTANCE_TEST PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-error=format-truncation>"
+  )
+endif()
 
 ConfigureTest(
   NAME NEIGHBORS_TIERED_INDEX_TEST

@@ -9,6 +9,7 @@
 #include "../pairwise_distance_base.cuh"  // PairwiseDistances
 #include "cutlass_base.cuh"
 #include "helper_structs.cuh"
+#include "low_k_tf32_dispatch.cuh"
 #include "simt_kernel.cuh"
 #include <raft/core/kvp.hpp>             // raft::KeyValuePair
 #include <raft/core/operators.hpp>       // raft::identity_op
@@ -24,23 +25,6 @@ namespace cuvs {
 namespace distance {
 
 namespace detail {
-
-template <typename IdxT>
-bool supportsLowKTF32Mma(IdxT m, IdxT n, IdxT k)
-{
-  if (m <= 0 || n <= 0 || k < 2 || k > 5 ||
-      m > static_cast<IdxT>(std::numeric_limits<int>::max()) ||
-      n > static_cast<IdxT>(std::numeric_limits<int>::max())) {
-    return false;
-  }
-  int device = 0;
-  RAFT_CUDA_TRY(cudaGetDevice(&device));
-  cudaDeviceProp properties{};
-  RAFT_CUDA_TRY(cudaGetDeviceProperties(&properties, device));
-  // MMA is the portable SM80+ backend. Future SM90a WGMMA and SM100/103 tcgen05
-  // implementations may override it when their compile-time feature targets are present.
-  return properties.major >= 8;
-}
 
 template <typename DataT,
           typename OutT,
@@ -109,7 +93,7 @@ void fusedL2NNImpl(OutT* min,
     L2Op L2_dist_op(sqrt);
 
     if constexpr (std::is_same_v<DataT, float>) {
-      if (supportsLowKTF32Mma(m, n, k)) {
+      if (is_low_k_tf32_problem<DataT>(m, n, k)) {
         switch (k) {
           case 2:
             cutlassFusedDistanceNNLowKTF32<2, P::Veclen>(x, y, xn, yn, m, n, min, workspace,

@@ -4,6 +4,8 @@
  */
 #pragma once
 
+#include "../../distance/detail/fused_distance_nn/low_k_tf32_dispatch.cuh"
+
 #include "../../distance/distance.cuh"
 #include <cstdint>
 #include <cuvs/cluster/kmeans.hpp>
@@ -54,7 +56,6 @@
 #include <ctime>
 #include <optional>
 #include <random>
-#include <type_traits>
 
 namespace cuvs::cluster::kmeans::detail {
 
@@ -72,9 +73,9 @@ bool use_fused(const raft::resources& handle, IdxT m, IdxT n, IdxT k)
 {
   cudaDeviceProp prop;
   prop = raft::resource::get_device_properties(handle);
-  if (prop.major >= 8 && std::is_same_v<MathT, float> && k >= 2 && k <= 5) {
-    // MMA is the portable fallback on every supported tensor-core generation. WGMMA and
-    // tcgen05 backends can replace it only under their exact compile-time feature targets.
+  if (cuvs::distance::detail::is_low_k_tf32_problem<MathT>(m, n, k)) {
+    // Route supported low-K problems to fusedDistanceNN. That implementation selects the MMA
+    // backend only when its selected CUDA code image has an SM80+ virtual architecture.
     return true;
   } else if (prop.major <= 8) {
     // Use fused for Ampere or before

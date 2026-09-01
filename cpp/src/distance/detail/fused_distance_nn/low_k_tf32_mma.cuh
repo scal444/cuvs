@@ -19,14 +19,13 @@ namespace cuvs::gemm::threadblock {
 template <int LogicalK, bool IsA>
 class LowKTF32InputIterator {
  public:
-  using Element     = float;
-  using Layout      = std::conditional_t<IsA, cutlass::layout::RowMajor,
-                                     cutlass::layout::ColumnMajor>;
+  using Element = float;
+  using Layout  = std::conditional_t<IsA, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>;
   using AccessType  = cutlass::Array<float, 1>;
   using Fragment    = cutlass::Array<float, 1>;
   using TensorCoord = cutlass::MatrixCoord;
   struct Params {
-    int64_t stride = 0;
+    int64_t stride               = 0;
     CUTLASS_HOST_DEVICE Params() = default;
     CUTLASS_HOST_DEVICE explicit Params(int64_t value) : stride(value) {}
   };
@@ -57,35 +56,43 @@ class LowKTF32Mma {
   // Portable native-MMA implementation for SM80+ targets. More capable architecture-feature
   // targets may override this fallback with WGMMA or tcgen05 backends.
   static_assert(LogicalK >= 2 && LogicalK <= 5);
-  static constexpr int PhysicalK = LogicalK == 2 ? 8 : 16;
+  static_assert(TileN > 0 && (TileN & (TileN - 1)) == 0);
+  static_assert(WarpN > 0 && TileN % WarpN == 0);
+
+  // FastF32 contributes three wanted products per logical K coordinate. Native TF32 MMA reduces
+  // in K8 groups, so the packed extent is rounded up to K8 and the remaining lanes are zero.
+  static constexpr int PackedK   = 3 * LogicalK;
+  static constexpr int PhysicalK = ((PackedK + 7) / 8) * 8;
   static constexpr int StorageK  = 16;
   static constexpr int MmaGroups = PhysicalK / 8;
-  using InternalShape = cutlass::gemm::GemmShape<32, TileN, StorageK>;
+  static_assert(PhysicalK <= StorageK);
+  using InternalShape     = cutlass::gemm::GemmShape<32, TileN, StorageK>;
   using InternalWarpShape = cutlass::gemm::GemmShape<32, WarpN, StorageK>;
-  using Core = cutlass::gemm::threadblock::DefaultMmaCore<
-    InternalShape,
-    InternalWarpShape,
-    cutlass::gemm::GemmShape<16, 8, 8>,
-    cutlass::tfloat32_t,
-    cutlass::layout::RowMajor,
-    cutlass::tfloat32_t,
-    cutlass::layout::RowMajor,
-    float,
-    cutlass::layout::RowMajor,
-    cutlass::arch::OpClassTensorOp,
-    2,
-    cutlass::arch::OpMultiplyAdd>;
+  using Core              = cutlass::gemm::threadblock::DefaultMmaCore<InternalShape,
+                                                                       InternalWarpShape,
+                                                                       cutlass::gemm::GemmShape<16, 8, 8>,
+                                                                       cutlass::tfloat32_t,
+                                                                       cutlass::layout::RowMajor,
+                                                                       cutlass::tfloat32_t,
+                                                                       cutlass::layout::RowMajor,
+                                                                       float,
+                                                                       cutlass::layout::RowMajor,
+                                                                       cutlass::arch::OpClassTensorOp,
+                                                                       2,
+                                                                       cutlass::arch::OpMultiplyAdd>;
 
  public:
-  using Shape       = cutlass::gemm::GemmShape<32, TileN, 16>;
-  using IteratorA   = LowKTF32InputIterator<LogicalK, true>;
-  using IteratorB   = LowKTF32InputIterator<LogicalK, false>;
-  using Operator    = typename Core::MmaTensorOp;
-  using Policy      = typename Core::MmaPolicy;
-  using FragmentC   = typename Operator::FragmentC;
-  using LayoutC     = cutlass::layout::RowMajor;
-  using ArchTag     = typename Operator::ArchTag;
-  using WarpCount   = cutlass::gemm::GemmShape<1, TileN / WarpN, 1>;
+  // The persistent cuVS scheduler sees exactly one K=16 tile. operator() below must therefore be
+  // invoked with one GEMM K iteration even when only the first K8 MMA group is needed for K=2.
+  using Shape              = cutlass::gemm::GemmShape<32, TileN, StorageK>;
+  using IteratorA          = LowKTF32InputIterator<LogicalK, true>;
+  using IteratorB          = LowKTF32InputIterator<LogicalK, false>;
+  using Operator           = typename Core::MmaTensorOp;
+  using Policy             = typename Core::MmaPolicy;
+  using FragmentC          = typename Operator::FragmentC;
+  using LayoutC            = cutlass::layout::RowMajor;
+  using ArchTag            = typename Operator::ArchTag;
+  using WarpCount          = cutlass::gemm::GemmShape<1, TileN / WarpN, 1>;
   static int const kStages = 1;
   static cutlass::ComplexTransform const kTransformA = cutlass::ComplexTransform::kNone;
   static cutlass::ComplexTransform const kTransformB = cutlass::ComplexTransform::kNone;
@@ -111,15 +118,18 @@ class LowKTF32Mma {
                                  IteratorB& iterator_b,
                                  FragmentC const& src_accum)
   {
+    CUTLASS_ASSERT(gemm_k_iterations == 1);
     accum = src_accum;
+    // A persistent thread block may reuse this union-backed shared storage after its epilogue.
+    // The entry and exit barriers prevent successive problem tiles from overlapping its lifetime.
     __syncthreads();
-    using LayoutA = typename Core::SmemLayoutA;
-    using LayoutB = typename Core::SmemLayoutB;
+    using LayoutA    = typename Core::SmemLayoutA;
+    using LayoutB    = typename Core::SmemLayoutB;
     LayoutA layout_a = LayoutA::packed({32, StorageK});
     LayoutB layout_b = LayoutB::packed({StorageK, TileN});
-    using Converter = cutlass::NumericConverterFastF32<
-      cutlass::FloatRoundStyle::round_toward_zero,
-      cutlass::FloatRoundStyle::round_half_ulp_truncate>;
+    using Converter =
+      cutlass::NumericConverterFastF32<cutlass::FloatRoundStyle::round_toward_zero,
+                                       cutlass::FloatRoundStyle::round_half_ulp_truncate>;
     Converter converter;
 
     // FastF32 approximates a*b with big(a)*big(b) + big(a)*small(b) +
@@ -141,25 +151,27 @@ class LowKTF32Mma {
       }
     }
     for (int index = threadIdx.x; index < 32 * LogicalK; index += blockDim.x) {
-      int row = index / LogicalK;
-      int dim = index % LogicalK;
+      int row        = index / LogicalK;
+      int dim        = index % LogicalK;
       int global_row = iterator_a.row_offset() + row;
-      float value = global_row < iterator_a.rows()
-                      ? iterator_a.pointer()[static_cast<int64_t>(global_row) * iterator_a.stride() + dim]
-                      : 0.0f;
-      auto parts = converter(value);
+      float value =
+        global_row < iterator_a.rows()
+          ? iterator_a.pointer()[static_cast<int64_t>(global_row) * iterator_a.stride() + dim]
+          : 0.0f;
+      auto parts                                             = converter(value);
       storage_.a.data()[layout_a({row, dim})]                = parts[0];
       storage_.a.data()[layout_a({row, LogicalK + dim})]     = parts[0];
       storage_.a.data()[layout_a({row, 2 * LogicalK + dim})] = parts[1];
     }
     for (int index = threadIdx.x; index < LogicalK * TileN; index += blockDim.x) {
-      int dim = index / TileN;
-      int col = index % TileN;
+      int dim        = index / TileN;
+      int col        = index % TileN;
       int global_col = iterator_b.column_offset() + col;
-      float value = global_col < iterator_b.columns()
-                      ? iterator_b.pointer()[static_cast<int64_t>(global_col) * iterator_b.stride() + dim]
-                      : 0.0f;
-      auto parts = converter(value);
+      float value =
+        global_col < iterator_b.columns()
+          ? iterator_b.pointer()[static_cast<int64_t>(global_col) * iterator_b.stride() + dim]
+          : 0.0f;
+      auto parts                                             = converter(value);
       storage_.b.data()[layout_b({dim, col})]                = parts[0];
       storage_.b.data()[layout_b({LogicalK + dim, col})]     = parts[1];
       storage_.b.data()[layout_b({2 * LogicalK + dim, col})] = parts[0];
@@ -191,7 +203,6 @@ class LowKTF32Mma {
       ++warp_b;
     }
     __syncthreads();
-    (void)gemm_k_iterations;
   }
 };
 
