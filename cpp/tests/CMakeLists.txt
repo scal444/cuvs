@@ -134,6 +134,23 @@ if(CMAKE_COMPILER_IS_GNUCXX)
   )
 endif()
 
+if(CUVS_ENABLE_SM90A_WGMMA)
+  ConfigureTest(
+    NAME LOW_K_WGMMA_SM90A_TEST
+    PATH neighbors/distance_nn_low_k_wgmma_sm90a.cu
+    HEADER_ONLY
+    GPUS 1
+    PERCENT 100
+  )
+  set_property(TARGET LOW_K_WGMMA_SM90A_TEST PROPERTY CUDA_ARCHITECTURES 90a-real)
+  if(CMAKE_COMPILER_IS_GNUCXX)
+    target_compile_options(
+      LOW_K_WGMMA_SM90A_TEST
+      PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-error=format-truncation>"
+    )
+  endif()
+endif()
+
 ConfigureTest(
   NAME NEIGHBORS_TIERED_INDEX_TEST
   PATH neighbors/tiered_index.cu

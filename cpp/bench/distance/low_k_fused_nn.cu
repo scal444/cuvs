@@ -10,6 +10,10 @@
 #include "../../src/distance/fused_distance_nn_helpers.cuh"
 #include "../../src/distance/unfused_distance_nn.cuh"
 
+#if defined(CUVS_ENABLE_SM90A_WGMMA)
+#include "../../src/distance/detail/fused_distance_nn/low_k_tf32_wgmma_sm90a.cuh"
+#endif
+
 #include <benchmark/benchmark.h>
 
 #include <raft/core/kvp.hpp>
@@ -35,7 +39,14 @@ namespace {
 using index_type  = int32_t;
 using output_type = raft::KeyValuePair<index_type, float>;
 
-enum class implementation { packed_tf32, cutlass_fast_f32, unfused_fp32 };
+enum class implementation {
+  packed_tf32,
+  cutlass_fast_f32,
+  unfused_fp32,
+#if defined(CUVS_ENABLE_SM90A_WGMMA)
+  wgmma_tf32,
+#endif
+};
 
 struct validation_result {
   std::size_t oracle_assignment_mismatches{};
@@ -242,6 +253,15 @@ class low_k_problem {
       stream_);
   }
 
+#if defined(CUVS_ENABLE_SM90A_WGMMA)
+  template <int LogicalK>
+  void run_wgmma()
+  {
+    cuvs::distance::detail::low_k_wgmma::launch<LogicalK>(
+      output_.data(), x_.data(), y_.data(), x_norm_.data(), y_norm_.data(), m_, n_, false, stream_);
+  }
+#endif
+
   template <int LogicalK>
   void run_for_k(implementation impl)
   {
@@ -249,6 +269,9 @@ class low_k_problem {
       case implementation::packed_tf32: run_fused<LogicalK>(true); break;
       case implementation::cutlass_fast_f32: run_fused<LogicalK>(false); break;
       case implementation::unfused_fp32: run_unfused(); break;
+#if defined(CUVS_ENABLE_SM90A_WGMMA)
+      case implementation::wgmma_tf32: run_wgmma<LogicalK>(); break;
+#endif
     }
   }
 
@@ -300,6 +323,10 @@ void cutlass_fast_f32(benchmark::State& state)
 
 void unfused_fp32(benchmark::State& state) { run_benchmark(state, implementation::unfused_fp32); }
 
+#if defined(CUVS_ENABLE_SM90A_WGMMA)
+void wgmma_tf32(benchmark::State& state) { run_benchmark(state, implementation::wgmma_tf32); }
+#endif
+
 void add_low_k_arguments(benchmark::internal::Benchmark* registration)
 {
   for (int k = 2; k <= 5; ++k) {
@@ -312,5 +339,8 @@ void add_low_k_arguments(benchmark::internal::Benchmark* registration)
 BENCHMARK(packed_tf32)->Apply(add_low_k_arguments);
 BENCHMARK(cutlass_fast_f32)->Apply(add_low_k_arguments);
 BENCHMARK(unfused_fp32)->Apply(add_low_k_arguments);
+#if defined(CUVS_ENABLE_SM90A_WGMMA)
+BENCHMARK(wgmma_tf32)->Apply(add_low_k_arguments);
+#endif
 
 }  // namespace
